@@ -21,23 +21,15 @@ level	path
 
 def project_root() -> Path:
     """
-    Dynamically find 'bearinguav' root directory.
+    Dynamically find project root directory.
     """
-    p = Path(__file__).resolve()
-    for parent in p.parents:
-        if parent.name == "bearinguav":
-            return parent
-    raise RuntimeError("bearinguav root not found")
+    return Path(__file__).resolve().parent.parent
 
 def dataset_path(name: str) -> Path:
     """
     Return root directory of dataset.
     """
-    p = Path(__file__).resolve()
-    for parent in p.parents:
-        if parent.name == "bearinguav":
-            return parent / name
-    raise RuntimeError("bearinguav root not found")
+    return project_root() / name
 
 # ---------- Project root directory
 proj_dir = project_root()  #"/your/path/of/proj/bearingnav/model/bearinguav" 

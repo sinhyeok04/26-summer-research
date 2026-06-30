@@ -2,6 +2,8 @@
 import os
 import re
 import json
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 import argparse
 import torch
 import torch.nn as nn

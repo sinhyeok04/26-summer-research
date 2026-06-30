@@ -47,8 +47,8 @@ image_id_map["-46.9_2.05_1000_1024_0.4_ny_city.jpg"] = 'ny'   # AirSim ModernCit
 
 # Fusion RSI dictionary (7 fusion combos for c8 maps; c2=31+32, c3=31+32+33, etc.)
 # This tag appears in trained model directory names.
-rsi_type = "40_1024"  # AirSim RSI resolution：40cm/pixel, 1024*1024 pixel side
-# rsi_type = "254k"  # set according to the RSI category in use
+# rsi_type = "40_1024"  # AirSim RSI resolution：40cm/pixel, 1024*1024 pixel side
+rsi_type = "254k"  # set according to the RSI category in use
 # rsi_type = '1m4k'
 
 d_rsi_paras = {
