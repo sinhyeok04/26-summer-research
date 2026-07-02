@@ -231,8 +231,7 @@ def test_par(dataset_dir,
 
     # Load model weights
     # Use map_location to remap checkpoint device to current available device
-    checkpoint = torch.load(f'{train_result_dir}/best_model.pth', \
-                            map_location=lambda storage, loc: storage.cuda(0))
+    checkpoint = torch.load(f'{train_result_dir}/best_model.pth', map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 

@@ -39,7 +39,7 @@ log_file="${LOG_DIR}/test_d${rsi_id}_3d${is_3d}_${timestamp}.log"
 echo "[Run] log_file=$log_file"
 
 # ====================== exe ======================
-nohup /usr/bin/time -v python -m cvphr.test.cvphr_test \
+nohup python -m cvphr.test.cvphr_test \
     --rsi_id "$rsi_id" \
     --is_3d "$is_3d" \
     --bestpth_dir "$bestpth_dir" \
