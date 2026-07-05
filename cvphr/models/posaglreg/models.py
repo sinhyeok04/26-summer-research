@@ -75,6 +75,7 @@ class SimilarityPositionPrior(nn.Module):
         fi_expand = ft.unsqueeze(1).expand(-1, 4, -1)  # [B, 4, D]
         sim = self.cos(fi_expand, neighbor_feats)  # [B, 4]
         weights = torch.softmax(sim, dim=1)  # [B, 4]
+        self.last_alpha = weights  # expose for uncertainty estimation (detached at read site)
 
         # Weighted relative position
         pos_prior = weights.unsqueeze(2) * self.rel_coords.unsqueeze(0)  # [B, 4, 2]
@@ -376,6 +377,7 @@ class PARCASGM_v5(PositionAngleRegressionSGM):
         # Enhance neighborhood features
         
         pos_soft_prior = self.sim_pos_prior(uav_patch_feature, neighbor_feats)  # [B, 2]  v5
+        self.last_alpha = self.sim_pos_prior.last_alpha  # [B, 4], PSG α for uncertainty
 
         if self.add_patch_coord:
             neighbor_feats = neighbor_feats + coord_embs  # [B,4,D]

@@ -13,7 +13,7 @@ from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 from datetime import datetime
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 
 from config.base_info import (
     id_image_map,  # Predefined image ID mapping (per number in comments)
@@ -45,6 +45,10 @@ from cvphr.models.posaglreg.models import PositionAngleRegressionSGM
 from cvphr.models.posaglreg.models import PARCASGM_v5a
 
 from cvphr.utils.utils_transform import transform_pipeline3
+from naver.utils.uncertainty import entropy_from_alpha, u_from_entropy
+from naver.vo.uav_vo import FrameToFrameVO
+from naver.fusion.dr_fusion import DRBearingFusion
+from naver.fusion.innovation_gated import InnovationGatedFusion
 
 
 class PHR_MODEL_LOADING_BASE:
@@ -145,7 +149,35 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
                  posreg_model_dir='',
                  model_class=PARCASGM_v5a,
                  model_kwargs=None,
-                 dataset_kwargs=None):
+                 dataset_kwargs=None,
+                 log_uncertainty=False,
+                 u_tau=0.5,
+                 u_k=10.0,
+                 u_mode='sigmoid',
+                 use_dr_bearing=False,
+                 anchor_threshold=30.0,
+                 vo_min_matches=12,
+                 fusion_mode='off',
+                 kf_q=100.0,
+                 kf_r=600.0,
+                 chi2_gate=5.99,
+                 use_soft_gate=False,
+                 soft_knee=1.0,
+                 reanchor_after=5,
+                 mn_m=3,
+                 mn_n=5,
+                 consensus_radius=15.0,
+                 vo_scale_init=1.2,
+                 use_scale_ema=False,
+                 ema_alpha=0.1,
+                 use_heading_limit=False,
+                 hunting_radius=50.0,
+                 max_heading_rate=30.0,
+                 uav_img_dir='',
+                 use_adaptive_r=False,
+                 r_ema_alpha=0.05,
+                 r_min=100.0,
+                 r_max=10000.0):
 
         # Call parent class initialization (model loading)
         super().__init__(
@@ -162,6 +194,8 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
         self.waypoints = waypoints
         self.block_cnt_point_dict = block_cnt_point_dict
         self.uav_2d3d = uav_2d3d
+        self.uav_img_dir = uav_img_dir
+        self._v3d_cache = {}
         self.uav_step = uav_step
         self.max_steps = max_steps
         self.output_dir = output_dir
@@ -207,6 +241,50 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
         
         self.ori_angle = 90  #Initial heading angle 90 degrees (due north)
         self.rs_traj_id = rs_traj_id
+        self.log_uncertainty = log_uncertainty
+        self.u_tau = u_tau
+        self.u_k = u_k
+        self.u_mode = u_mode
+
+        # DR-Bearing v1: fixed-weight VO fusion (preserved for fusion_mode='v1')
+        self.use_dr_bearing = use_dr_bearing
+        if use_dr_bearing:
+            _vo = FrameToFrameVO(min_response=0.05, scale_factor=1.25)
+            self.dr_fusion = DRBearingFusion(vo=_vo, anchor_threshold=anchor_threshold)
+        else:
+            self.dr_fusion = None
+
+        # DR-Bearing v2: innovation-gated Kalman fusion
+        self.fusion_mode = fusion_mode
+        if fusion_mode == 'v2':
+            _vo2 = FrameToFrameVO(min_response=0.05, scale_factor=vo_scale_init)
+            self.igf = InnovationGatedFusion(
+                vo=_vo2,
+                kf_q=kf_q,
+                kf_r=kf_r,
+                chi2_gate=chi2_gate,
+                use_soft_gate=use_soft_gate,
+                soft_knee=soft_knee,
+                reanchor_after=reanchor_after,
+                mn_m=mn_m,
+                mn_n=mn_n,
+                consensus_radius=consensus_radius,
+                vo_scale_init=vo_scale_init,
+                use_scale_ema=use_scale_ema,
+                ema_alpha=ema_alpha,
+                use_adaptive_r=use_adaptive_r,
+                r_ema_alpha=r_ema_alpha,
+                r_min=r_min,
+                r_max=r_max,
+            )
+        else:
+            self.igf = None
+
+        # Heading rate limiter (independent of fusion, ablation target)
+        self.use_heading_limit = use_heading_limit
+        self.hunting_radius = hunting_radius
+        self.max_heading_rate = max_heading_rate
+        self._prev_fly_angle: Optional[float] = None
 
         # Initialize DataFrame for recording data
         self.records = pd.DataFrame()
@@ -385,6 +463,29 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
         
         return lng, lat
 
+    def _find_nearest_v3d(self, block_x: int, block_y: int, lat: float, lng: float) -> Optional[str]:
+        cache_key = (block_x, block_y)
+        if cache_key not in self._v3d_cache:
+            import glob
+            pattern = os.path.join(self.uav_img_dir, f'blk_{block_x}_{block_y}_s_*_v3d.json')
+            entries = []
+            for jpath in glob.glob(pattern):
+                try:
+                    with open(jpath) as f:
+                        d = json.load(f)
+                    img_path = jpath.replace('.json', '.jpg')
+                    if os.path.exists(img_path):
+                        entries.append((d['lat'], d['lng'], img_path))
+                except Exception:
+                    pass
+            self._v3d_cache[cache_key] = entries
+        entries = self._v3d_cache[cache_key]
+        if not entries:
+            return None
+        cos_lat = math.cos(math.radians(lat))
+        best = min(entries, key=lambda e: ((e[0]-lat)*111320)**2 + ((e[1]-lng)*111320*cos_lat)**2)
+        return best[2]
+
     def get_patches(self, uav_frame_id, fly_angle_ccs, next_point_real, block_center, block_indices: Tuple[int, int]) -> List[np.ndarray]:
         """
         Get four patches of specified block (calculated from nominal next_point_name)
@@ -440,10 +541,16 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
         # fly_angle represents UAV perspective image direction angle, range 0->360 counterclockwise from right
         theta = fly_angle_ccs  #theta is heading angle fly_angle!
 
-        # Crop target patch, note cropped_img is rsi image, not block image
-        target_patch = crop_target_patch(nextpt_real_x, nextpt_real_y, theta, cropped_img)   
-        # Convert PIL Image to numpy array and add to patches list *
-        target_patch = np.array(target_patch)
+        # target_patch: 3D mode loads nearest pre-captured UAV cross-view image;
+        #               2D mode crops nadir patch from the satellite RSI.
+        if self.uav_2d3d == '3d' and self.uav_img_dir:
+            v3d_path = self._find_nearest_v3d(block_x, block_y, next_point_real[1], next_point_real[0])
+            if v3d_path is not None:
+                target_patch = cv2.imread(v3d_path)
+            else:
+                target_patch = np.array(crop_target_patch(nextpt_real_x, nextpt_real_y, theta, cropped_img))
+        else:
+            target_patch = np.array(crop_target_patch(nextpt_real_x, nextpt_real_y, theta, cropped_img))
         patches.append(target_patch)
         
         center_x, center_y = int(nextpt_real_x), int(nextpt_real_y)       
@@ -544,8 +651,11 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
             pos_pred, dir_pred = self.model(patches_tensor)
             pos_pred = pos_pred.cpu().numpy()[0]
             dir_pred = dir_pred.cpu().numpy()[0]
-            # predictions.append(pred_coords)
-        return pos_pred, dir_pred
+            # Extract PSG alpha for uncertainty estimation (stored by model.last_alpha)
+            alpha = None
+            if hasattr(self.model, 'last_alpha') and self.model.last_alpha is not None:
+                alpha = self.model.last_alpha.detach().cpu().numpy()[0]  # [4]
+        return pos_pred, dir_pred, alpha
 
     def calculate_distance(self, 
                          point1: Tuple[float, float], 
@@ -630,7 +740,7 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
         if record["flag_out_of_map"] == True or len(patches)!=5:
             # print(f" * | UAV飞出地图边界，退出飞行！！！总步数{uav_frame_id}, 距离终点{distance_ep}米。")
             flag_out_of_map = True
-            pos_pred, dir_pred = None, None
+            pos_pred, dir_pred, alpha = None, None, None
             print(f" * | UAV flies out of map boundary, exit flight!!!")
         else:
             flag_out_of_map = False
@@ -638,8 +748,8 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
             # Position and direction regression.
             # UAV current real position is at r_i, algorithm regresses nominal position n_i based on r_i
             # pos_pred is unit relative coordinate predicted by regression model, range [-1, 1], dir_pred is unit direction vector predicted by regression model, range [-1, 1]
-            pos_pred, dir_pred = self.position_angle_regression_(patches) 
-        return pos_pred, dir_pred, flag_out_of_map, patches_fdirs, record
+            pos_pred, dir_pred, alpha = self.position_angle_regression_(patches)
+        return pos_pred, dir_pred, alpha, flag_out_of_map, patches_fdirs, record
         
 
 
@@ -711,7 +821,7 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
                 # UAV current real position is at r_i, algorithm regresses nominal position n_i based on r_i
                 # pos_pred is unit relative coordinate predicted by regression model, range [-1, 1], dir_pred is unit direction vector predicted by regression model, range [-1, 1]
                 # In gift mode, patches_fdirs represents target_patch_fdir, making self.phreg universal
-                pos_pred, dir_pred, flag_out_of_map, patches_fdirs, record = self.phreg(
+                pos_pred, dir_pred, alpha, flag_out_of_map, patches_fdirs, record = self.phreg(
                     uav_frame_id, fly_angle_ccs, cur_point_real, block_center, block_indices
                 )
                 
@@ -725,6 +835,44 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
 
                 # Predict longitude/latitude of current UAV position point, i.e. current nominal longitude/latitude position
                 cur_point_pred = self.pred_point_from_norm(x_pred_, y_pred_, block_center, block_size=512)
+
+                # --- DR-Bearing: uncertainty logging + fusion (v1 or v2) ---
+                entropy_norm = None
+                u = None
+                vo_used = False
+                igf_info = None
+                if alpha is not None:
+                    entropy_norm = entropy_from_alpha(alpha)
+                    u = u_from_entropy(entropy_norm, mode=self.u_mode, tau=self.u_tau, k=self.u_k)
+                    if self.log_uncertainty:
+                        self.nav_step['alpha'] = alpha.tolist()
+                        self.nav_step['entropy_norm'] = entropy_norm
+                        self.nav_step['u'] = u
+
+                if self.use_dr_bearing and self.dr_fusion is not None and u is not None:
+                    # v1: fixed-weight blend controlled by PSG entropy
+                    uvp_img = cv2.imread(patches_fdirs[4])
+                    if uvp_img is not None:
+                        cur_point_pred, vo_used = self.dr_fusion.step(
+                            model_pred=cur_point_pred,
+                            uvp_img=uvp_img,
+                            theta_deg=fly_angle_ccs,
+                            scale_m_per_px=self.latm_per_pixel,
+                            u=u,
+                        )
+                elif self.fusion_mode == 'v2' and self.igf is not None:
+                    # v2: innovation-gated Kalman fusion (no PSG entropy needed)
+                    uvp_img = cv2.imread(patches_fdirs[4])
+                    if uvp_img is not None:
+                        cur_point_pred, igf_info = self.igf.step(
+                            model_pred=cur_point_pred,
+                            uvp_img=uvp_img,
+                            theta_deg=fly_angle_ccs,
+                            scale_m_per_px=self.latm_per_pixel,
+                        )
+                        vo_used = bool(igf_info.get('accept', False))
+                # ------------------------------------------------------
+
                 direct_pred = normalize_vector(dir_pred)  # Normalize
                 direct_pred_llcs = convert_ccs_to_llcs_vector(direct_pred, cur_point_pred[1])
                 angle_pred = vector2angle(direct_pred[0], direct_pred[1])
@@ -765,6 +913,20 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
                 ref_angle_ccs = vector2angle(ref_direct_ccs[0], ref_direct_ccs[1])
                 #Navigation strategy: update heading angle based on predicted nominal position and local target waypoint
                 fly_angle_ccs = ref_angle_ccs + 360 if ref_angle_ccs < 0 else ref_angle_ccs
+
+                # Heading rate limiter: damps heading hunting near waypoints (control fix,
+                # independent of fusion uncertainty). Enabled by --use_heading_limit.
+                if self.use_heading_limit and self._prev_fly_angle is not None:
+                    d_wp_now = math.hypot(
+                        (cur_point_pred[0] - target_waypoint[0]) * 111320 * math.cos(math.radians(cur_point_pred[1])),
+                        (cur_point_pred[1] - target_waypoint[1]) * 111320,
+                    )
+                    if d_wp_now < self.hunting_radius:
+                        delta_h = (fly_angle_ccs - self._prev_fly_angle + 180.0) % 360.0 - 180.0
+                        if abs(delta_h) > self.max_heading_rate:
+                            fly_angle_ccs = (self._prev_fly_angle + self.max_heading_rate * (1.0 if delta_h > 0 else -1.0)) % 360.0
+                self._prev_fly_angle = fly_angle_ccs
+
                 fly_direct_ccs = angle2vector(fly_angle_ccs)  #Direction vector
 
                 print(f"|step3| ---3.Update fly angle ---")
@@ -862,7 +1024,23 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
                     'direct_pred_llcs_x': direct_pred_llcs[0],
                     'direct_pred_llcs_y': direct_pred_llcs[1],
                 }
-                
+                # DR-Bearing v1: append entropy/VO fields when logging or v1 fusion active
+                if (self.log_uncertainty or self.use_dr_bearing) and entropy_norm is not None:
+                    record_dict['entropy_norm'] = entropy_norm
+                    record_dict['u'] = u
+                    record_dict['vo_used'] = int(vo_used)
+                # DR-Bearing v2: append KF diagnostics
+                if igf_info is not None:
+                    record_dict['kf_d2'] = igf_info['d2']
+                    record_dict['kf_accept'] = igf_info['accept']
+                    record_dict['kf_K'] = igf_info['K']
+                    record_dict['kf_P'] = igf_info['P']
+                    record_dict['kf_R_eff'] = igf_info['R_eff']
+                    record_dict['kf_R_hat'] = igf_info['R_hat']
+                    record_dict['kf_consec_reject'] = igf_info['consec_reject']
+                    record_dict['kf_vo_scale'] = igf_info['vo_scale']
+                    record_dict['kf_vo_valid'] = igf_info['vo_valid']
+
                 # Add record to DataFrame
                 self.records = pd.concat([self.records, pd.DataFrame([record_dict])], ignore_index=True)
                 
@@ -914,16 +1092,43 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
 
 
 def main_nav_test(
-    rsi_id='38bc', 
+    rsi_id='38bc',
     rsi_type='254k',
-    traj_id=0, 
-    uav_step =30, 
-    uav_2d3d='2d', 
-    th_arrive=None, 
+    traj_id=0,
+    uav_step =30,
+    uav_2d3d='2d',
+    th_arrive=None,
     project_dir='',
     cvphr_3d_best_model_dir='',
     cvphr_2d_best_model_dir='',
-    flag_suppl=False):
+    flag_suppl=False,
+    log_uncertainty=False,
+    u_tau=0.5,
+    u_k=10.0,
+    u_mode='sigmoid',
+    use_dr_bearing=False,
+    anchor_threshold=30.0,
+    vo_min_matches=12,
+    fusion_mode='off',
+    kf_q=100.0,
+    kf_r=600.0,
+    chi2_gate=5.99,
+    use_soft_gate=False,
+    soft_knee=1.0,
+    reanchor_after=5,
+    mn_m=3,
+    mn_n=5,
+    consensus_radius=15.0,
+    vo_scale_init=1.2,
+    use_scale_ema=False,
+    ema_alpha=0.1,
+    use_heading_limit=False,
+    hunting_radius=50.0,
+    max_heading_rate=30.0,
+    use_adaptive_r=False,
+    r_ema_alpha=0.05,
+    r_min=100.0,
+    r_max=10000.0):
     """
     flag_suppl: Whether to use supplementary waypoints to test model performance on supplementary waypoints
     User needs to specify:
@@ -960,10 +1165,19 @@ def main_nav_test(
     n_block = 15
     if uav_2d3d == '3d':    # Optim 3D Model
         phr_model_dir = cvphr_3d_best_model_dir
-    
+
     if uav_2d3d == '2d':    # Optim 2D Model
         phr_model_dir = cvphr_2d_best_model_dir
-        
+
+    # 7b. UAV cross-view image dir (3D only): rsi_id → citya/b/c/d
+    _RSI_TO_CITY = {'34bc': 'citya', '36bc': 'cityb', '37bc': 'cityc', '38bc': 'cityd'}
+    if uav_2d3d == '3d' and rsi_id in _RSI_TO_CITY:
+        uav_img_dir = os.path.join(project_dir, 'Bearing_UAV_90K',
+                                   _RSI_TO_CITY[rsi_id],
+                                   f'uav_254k_{rsi_id}_b15_s100')
+    else:
+        uav_img_dir = ''
+
     # Your remote sensing map path to test
     rsi_dir = rsi_dir_city8_25pp_4096bc
     
@@ -1057,7 +1271,35 @@ def main_nav_test(
             # model_class=PositionRegressionModel,
             model_class=model_class,
             model_kwargs=model_kwargs,
-            dataset_kwargs={}
+            dataset_kwargs={},
+            log_uncertainty=log_uncertainty,
+            u_tau=u_tau,
+            u_k=u_k,
+            u_mode=u_mode,
+            use_dr_bearing=use_dr_bearing,
+            anchor_threshold=anchor_threshold,
+            vo_min_matches=vo_min_matches,
+            fusion_mode=fusion_mode,
+            kf_q=kf_q,
+            kf_r=kf_r,
+            chi2_gate=chi2_gate,
+            use_soft_gate=use_soft_gate,
+            soft_knee=soft_knee,
+            reanchor_after=reanchor_after,
+            mn_m=mn_m,
+            mn_n=mn_n,
+            consensus_radius=consensus_radius,
+            vo_scale_init=vo_scale_init,
+            use_scale_ema=use_scale_ema,
+            ema_alpha=ema_alpha,
+            use_heading_limit=use_heading_limit,
+            hunting_radius=hunting_radius,
+            max_heading_rate=max_heading_rate,
+            uav_img_dir=uav_img_dir,
+            use_adaptive_r=use_adaptive_r,
+            r_ema_alpha=r_ema_alpha,
+            r_min=r_min,
+            r_max=r_max,
         )
         print("✓ UAVNavigation instance created successfully")
         print(f"  Device: {nav.device}")
@@ -1159,6 +1401,104 @@ def parse_args():
         help="2D best model directory",
     )
 
+    # DR-Bearing: uncertainty logging (Phase 1)
+    parser.add_argument(
+        "--log_uncertainty",
+        action="store_true",
+        default=False,
+        help="Log PSG alpha / entropy / u fields to CSV (DR-Bearing Phase 1)",
+    )
+    parser.add_argument(
+        "--u_tau",
+        type=float,
+        default=0.5,
+        help="Sigmoid midpoint for uncertainty mapping (default 0.5)",
+    )
+    parser.add_argument(
+        "--u_k",
+        type=float,
+        default=10.0,
+        help="Sigmoid steepness for uncertainty mapping (default 10.0)",
+    )
+    parser.add_argument(
+        "--u_mode",
+        type=str,
+        default="sigmoid",
+        choices=["sigmoid", "linear"],
+        help="Entropy-to-uncertainty mapping mode (default sigmoid)",
+    )
+
+    # DR-Bearing: VO fusion (Phase 3)
+    parser.add_argument(
+        "--use_dr_bearing",
+        action="store_true",
+        default=False,
+        help="Enable DR-Bearing VO fusion (Phase 3): fuses model prediction with VO dead reckoning",
+    )
+    parser.add_argument(
+        "--anchor_threshold",
+        type=float,
+        default=30.0,
+        help="Max metres between model and VO estimates before VO is discarded (default 30.0)",
+    )
+    parser.add_argument(
+        "--vo_min_matches",
+        type=int,
+        default=12,
+        help="Minimum ORB inlier matches required for VO to be used (default 12)",
+    )
+
+    # DR-Bearing v2: Innovation-Gated Kalman Fusion
+    parser.add_argument(
+        "--fusion_mode",
+        type=str,
+        default="off",
+        choices=["off", "v1", "v2"],
+        help="Fusion mode: off=baseline, v1=PSG-entropy blend, v2=KF-gated (default off)",
+    )
+    parser.add_argument("--kf_q", type=float, default=100.0,
+                        help="KF process noise Q m² (default 100=(10m)²)")
+    parser.add_argument("--kf_r", type=float, default=600.0,
+                        help="KF measurement noise R m² (default 600≈(24.5m)²)")
+    parser.add_argument("--chi2_gate", type=float, default=5.99,
+                        help="Chi-squared gate threshold 2-DoF 95%% (default 5.99)")
+    parser.add_argument("--use_soft_gate", action="store_true", default=False,
+                        help="Enable soft gate: inflate R proportional to d² for borderline measurements")
+    parser.add_argument("--soft_knee", type=float, default=1.0,
+                        help="d² threshold below which soft gate is inactive (default 1.0)")
+    parser.add_argument("--reanchor_after", type=int, default=5,
+                        help="Consecutive rejections before M-of-N re-anchor check (default 5)")
+    parser.add_argument("--mn_m", type=int, default=3,
+                        help="M-of-N: require M gate-passes (default 3)")
+    parser.add_argument("--mn_n", type=int, default=5,
+                        help="M-of-N: window size N (default 5)")
+    parser.add_argument("--consensus_radius", type=float, default=15.0,
+                        help="M-of-N consensus cluster radius in metres (default 15)")
+    parser.add_argument("--vo_scale_init", type=float, default=1.2,
+                        help="Initial VO phase-correlation scale correction factor (default 1.2)")
+    parser.add_argument("--use_scale_ema", action="store_true", default=False,
+                        help="Enable online EMA adaptation of VO scale on accepted steps")
+    parser.add_argument("--ema_alpha", type=float, default=0.1,
+                        help="EMA smoothing coefficient for VO scale update (default 0.1)")
+
+    # Heading rate limiter (independent ablation target)
+    parser.add_argument("--use_heading_limit", action="store_true", default=False,
+                        help="Clamp heading rate near waypoints to suppress hunting oscillation")
+    parser.add_argument("--hunting_radius", type=float, default=50.0,
+                        help="Distance to WP (m) inside which heading limiter activates (default 50)")
+    parser.add_argument("--max_heading_rate", type=float, default=30.0,
+                        help="Max heading change per step in degrees (default 30)")
+
+    # Adaptive R
+    parser.add_argument("--use_adaptive_r", action="store_true", default=False,
+                        help="Enable EMA-based online estimation of model measurement noise R")
+    parser.add_argument("--r_ema_alpha", type=float, default=0.05,
+                        help="EMA coefficient for R_hat update (default 0.05)")
+    parser.add_argument("--r_min", type=float, default=100.0,
+                        help="Minimum clamp for adaptive R_hat in m^2 (default 100)")
+    parser.add_argument("--r_max", type=float, default=10000.0,
+                        help="Maximum clamp for adaptive R_hat in m^2 (default 10000)")
+
     return parser.parse_args()
 
 def main():
@@ -1216,6 +1556,33 @@ def main():
                         cvphr_3d_best_model_dir=cvphr_3d_best_model_dir,
                         cvphr_2d_best_model_dir=cvphr_2d_best_model_dir,
                         flag_suppl=args.suppl_test,  #if U want suppl test
+                        log_uncertainty=args.log_uncertainty,
+                        u_tau=args.u_tau,
+                        u_k=args.u_k,
+                        u_mode=args.u_mode,
+                        use_dr_bearing=args.use_dr_bearing,
+                        anchor_threshold=args.anchor_threshold,
+                        vo_min_matches=args.vo_min_matches,
+                        fusion_mode=args.fusion_mode,
+                        kf_q=args.kf_q,
+                        kf_r=args.kf_r,
+                        chi2_gate=args.chi2_gate,
+                        use_soft_gate=args.use_soft_gate,
+                        soft_knee=args.soft_knee,
+                        reanchor_after=args.reanchor_after,
+                        mn_m=args.mn_m,
+                        mn_n=args.mn_n,
+                        consensus_radius=args.consensus_radius,
+                        vo_scale_init=args.vo_scale_init,
+                        use_scale_ema=args.use_scale_ema,
+                        ema_alpha=args.ema_alpha,
+                        use_heading_limit=args.use_heading_limit,
+                        hunting_radius=args.hunting_radius,
+                        max_heading_rate=args.max_heading_rate,
+                        use_adaptive_r=args.use_adaptive_r,
+                        r_ema_alpha=args.r_ema_alpha,
+                        r_min=args.r_min,
+                        r_max=args.r_max,
                     )
 
 
