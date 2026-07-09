@@ -40,6 +40,7 @@ echo "[Run] repo_root=$REPO_ROOT"
 echo "[Run] log_file=$log_file"
 
 nohup /usr/bin/time -v python -m cvphr.train.cvphr_train \
+    --model_class "PARCASGM_v6" \
     --is_3d "$is_3d" \
     --rsi_id "$rsi_id" \
     --n_sample "$sample" \

@@ -261,6 +261,7 @@ def test_par(dataset_dir,
     pred_directions = []        # Predicted vector directions (degrees) for all test samples
     gt_positions = []           # Ground truth relative positions (pixels) for all test samples
     gt_directions = []          # Ground truth vector directions (degrees) for all test samples
+    prior_data = []             # List to store soft prior for visualization
 
 
     with torch.no_grad():
@@ -274,7 +275,18 @@ def test_par(dataset_dir,
             B = patches.size(0)
 
             # Predict relative position and vector direction
-            pos_pred, dir_pred = model(patches)
+            try:
+                pos_pred, dir_pred, pos_soft_prior = model(patches, return_prior=True)
+                for b_idx in range(B):
+                    prior_data.append({
+                        'target_path': target_paths[b_idx],
+                        'gt_pos_x': coords[b_idx, 0].item(),
+                        'gt_pos_y': coords[b_idx, 1].item(),
+                        'prior_x': pos_soft_prior[b_idx, 0].item(),
+                        'prior_y': pos_soft_prior[b_idx, 1].item()
+                    })
+            except TypeError:
+                pos_pred, dir_pred = model(patches)
 
             # Handle multi-task, single-task, and joint training modes - compute test loss
             if loss_type == 'multitask':  # Multi-task: different loss functions
@@ -430,6 +442,15 @@ def test_par(dataset_dir,
     print("\nFinal Results:")
     print(f"MLE_dis_mean: {MLE_dis_mean:.4f}")
     print(f"MHE_agl_mean: {MHE_agl_mean:.4f}")
+
+    if len(prior_data) > 0:
+        import pandas as pd
+        from pathlib import Path
+        prior_csv_path = Path(test_result_dir).parent / "prior_comparison.csv"
+        df_prior = pd.DataFrame(prior_data)
+        df_prior['model_name'] = model.model_name
+        df_prior.to_csv(prior_csv_path, mode='a', header=not prior_csv_path.exists(), index=False)
+        print(f"Saved prior data to {prior_csv_path}")
 
     # Create metrics dict
     test_mae = {

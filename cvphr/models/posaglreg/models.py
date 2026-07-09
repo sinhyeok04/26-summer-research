@@ -58,6 +58,28 @@ class NeighborsCrossAttention(nn.Module):
         out = torch.bmm(attn, v).squeeze(1)  # [B, num_clusters * D/r]
         return out
 
+class NeighborsCrossAttention_v6(nn.Module):
+    def __init__(self, feat_dim=256, reduction_ratio=1):
+        super().__init__()
+        reduced_dim = feat_dim // reduction_ratio
+        
+        self.q_proj = nn.Linear(feat_dim, reduced_dim)
+        self.k_proj = nn.Linear(feat_dim, reduced_dim)
+        self.v_proj = nn.Linear(feat_dim, reduced_dim)
+        
+    def forward(self, query, keys):
+        assert query.shape[-1] == self.q_proj.in_features, \
+            f"Expected query with dim {self.q_proj.in_features}, got {query.shape[-1]}"
+
+        q = self.q_proj(query).unsqueeze(1)  # [B, 1, num_clusters * D/r]
+        k = self.k_proj(keys)                # [B, 4, num_clusters * D/r]
+        v = self.v_proj(keys)                # [B, 4, num_clusters * D/r]
+        
+        attn = torch.bmm(q, k.transpose(1,2)) / np.sqrt(q.size(-1))  # [B, 1, 4]
+        attn = F.softmax(attn, dim=-1)
+        out = torch.bmm(attn, v).squeeze(1)  # [B, num_clusters * D/r]
+        return out, attn.squeeze(1)
+
 class SimilarityPositionPrior(nn.Module):
     def __init__(self, feat_dim):
         super().__init__()
@@ -350,7 +372,7 @@ class PARCASGM_v5(PositionAngleRegressionSGM):
         sgm_output = self.sgm(patch)
         return sgm_output['descriptor_flatten']  # d_flatten,[B, K*D]
     
-    def forward(self, patches, debug_dir=''):
+    def forward(self, patches, debug_dir='', return_prior=False):
         # patches: [B, 5, C, H, W]        
         # Extract features (shared weights)
         B = patches.size(0)
@@ -391,6 +413,8 @@ class PARCASGM_v5(PositionAngleRegressionSGM):
         pos_pred = self.pos_regressor(combined_with_prior)
         dir_pred = self.dir_regressor(combined)
 
+        if return_prior:
+            return pos_pred, dir_pred, pos_soft_prior
         return pos_pred, dir_pred
 
 class PARCASGM_v5a(PARCASGM_v5):
@@ -433,6 +457,105 @@ class PARCASGM_v5a(PARCASGM_v5):
         self.sgm = JointNet_soft(None, self.csmg)
         self.sgm.backbone = self.backbone
 
+
+class PARCASGM_v6(PositionAngleRegressionSGM):
+    def __init__(self, 
+                 backbone_name='vgg16',
+                 feature_dim=256, 
+                 coord_enc_dims=[16, 64, 256],
+                 regressor_dims=[1024, 256, 64],
+                 reduction_ratio=1,
+                 num_clusters=4,
+                 freeze_backbone=True,
+                 partial_unfreeze=False,
+                 add_patch_coord=True):
+        super().__init__(
+            feature_dim=feature_dim,
+            coord_enc_dims=coord_enc_dims,
+            regressor_dims=regressor_dims,
+            reduction_ratio=reduction_ratio,
+            backbone_name=backbone_name,
+            num_clusters=num_clusters,
+            freeze_backbone=freeze_backbone,
+            partial_unfreeze=partial_unfreeze,
+            add_patch_coord=add_patch_coord
+        )
+        
+        self.model_name = 'phr6'
+        
+        # Softmax normalization version from v5a
+        self.csmg = CSMG_soft(input_channel=self.backbone_out_dim, output_channel=self.feature_dim, num_clusters=num_clusters)
+        self.sgm = JointNet_soft(None, self.csmg)
+        self.sgm.backbone = self.backbone
+        
+        # Replace the CA module with the new v6 version that returns attn
+        self.neighbors_cross_attn = NeighborsCrossAttention_v6(
+            feat_dim=self.feature_dim*num_clusters, 
+            reduction_ratio=reduction_ratio
+        )
+
+        # DELETED: self.sim_pos_prior
+
+        # Redefine position branch to accept +2 dims from pos_soft_prior
+        self.pos_in_dim = self.reg_in_dim + 2
+        pos_regressor_layers = []
+        for out_dim_ in regressor_dims:
+            pos_regressor_layers.append(nn.Linear(self.pos_in_dim, out_dim_))
+            pos_regressor_layers.append(nn.ReLU())
+            self.pos_in_dim = out_dim_
+        pos_regressor_layers.append(nn.Linear(self.pos_in_dim, 2))  # Output x, y
+        self.pos_regressor = nn.Sequential(*pos_regressor_layers)
+
+    def _model_device(self):
+        return next(self.parameters()).device
+
+    def _model_dtype(self):
+        return next(self.parameters()).dtype
+
+    def encode_patch(self, patch: torch.Tensor) -> torch.Tensor:
+        sgm_output = self.sgm(patch)
+        return sgm_output['descriptor_flatten']
+
+    def forward(self, patches, debug_dir='', return_prior=False):
+        B = patches.size(0)
+        sgm_outputs = []
+        _5patch_features = []
+        for i in range(5):
+            patch = patches[:, i]
+            sgm_output = self.sgm(patch)
+            d_flatten = sgm_output['descriptor_flatten']
+            _5patch_features.append(d_flatten)
+            sgm_outputs.append(sgm_output)
+
+        f1, f2, f3, f4, uav_patch_feature = _5patch_features
+        neighbor_feats = torch.stack([f1, f2, f3, f4], dim=1)  # [B,4,D]
+
+        # 4 neighborhood relative coordinates
+        u = 1.0
+        known_coords = torch.tensor([[-u,-u], [-u,u], [u,-u], [u,u]],
+                                   dtype=torch.float32, device=patches.device) 
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).repeat(B,1,1)  # [B,4,D]
+
+        if self.add_patch_coord:
+            neighbor_feats = neighbor_feats + coord_embs  # [B,4,D]
+            
+        # Cross attention (v6 returns both context feature and attention weights)
+        ctx_feat, attn_weights = self.neighbors_cross_attn(uav_patch_feature, neighbor_feats)  # ctx: [B, D], attn: [B, 4]
+
+        # Calculate pos_soft_prior using attention weights
+        pos_soft_prior = torch.matmul(attn_weights, known_coords)  # [B, 2]
+
+        # Feature fusion
+        combined = torch.cat([uav_patch_feature, ctx_feat], dim=1)  # [B, D + D']
+        combined_with_prior = torch.cat([combined, pos_soft_prior], dim=1)  # [B, D + D' + 2]
+
+        # Regression
+        pos_pred = self.pos_regressor(combined_with_prior)
+        dir_pred = self.dir_regressor(combined)
+
+        if return_prior:
+            return pos_pred, dir_pred, pos_soft_prior
+        return pos_pred, dir_pred
 
 class RSBlockDatasetPA_v3q(Dataset):
     """
@@ -612,15 +735,15 @@ def par_dataloader(metadata_csv, dataset_class, dataset_kwargs, BATCH_SIZE):
     test_dataset = torch.utils.data.Subset(norm_dataset, test_indices.indices)
     
     # Create data loaders
-    num_workers = 8  # Or 8, depending on machine CPU
+    num_workers = 8  # Changed to 8 for max performance
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True,
-        persistent_workers=True,   # ★ Reuse workers to avoid restart per epoch
+        persistent_workers=False,   # ★ Reuse workers to avoid restart per epoch
         prefetch_factor=2,         # Default 2 is fine, adjust if needed
     )
     val_loader = DataLoader(
@@ -628,8 +751,8 @@ def par_dataloader(metadata_csv, dataset_class, dataset_kwargs, BATCH_SIZE):
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
+        pin_memory=False,
+        persistent_workers=False,
         prefetch_factor=2,
     )
     test_loader = DataLoader(
@@ -637,8 +760,8 @@ def par_dataloader(metadata_csv, dataset_class, dataset_kwargs, BATCH_SIZE):
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
+        pin_memory=False,
+        persistent_workers=False,
         prefetch_factor=2,
     )
 
@@ -712,11 +835,13 @@ model_kwargs_par_ca_sgm_v5a={
 MODEL_CLASS_DICT = {
     "PARCASGM_v5":          PARCASGM_v5,
     "PARCASGM_v5a":         PARCASGM_v5a,
+    "PARCASGM_v6":          PARCASGM_v6,
 }
 
 MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5":          model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
+    "PARCASGM_v6":          model_kwargs_par_ca_sgm_v5a,
 }
 
 DATASET_CLASS_DICT = {
