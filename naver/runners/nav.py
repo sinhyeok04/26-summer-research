@@ -55,16 +55,18 @@ class PHR_MODEL_LOADING_BASE:
     """
     PHR model loading base class, provides unified model loading logic
     """
-    def __init__(self, 
+    def __init__(self,
                  device_id=0,
                  posreg_model_dir='',
                  model_class=PARCASGM_v5a,
                  model_kwargs=None,
-                 dataset_kwargs=None):
+                 dataset_kwargs=None,
+                 use_mps=False):
         """
         Initialize PHR model, provide unified model loading steps
         """
         self.device_id = device_id
+        self.use_mps = use_mps
         self.posreg_model_dir = posreg_model_dir
         self.model_class = model_class
         self.model_kwargs = model_kwargs or {}
@@ -81,7 +83,12 @@ class PHR_MODEL_LOADING_BASE:
         Unified model loading logic
         """
         print("\n + Initial Best Model...")
-        self.device = torch.device(f"cuda:{self.device_id}" if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{self.device_id}")
+        elif self.use_mps and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         print(f"Using device: {self.device}")
         
         # Initialize model with incoming model_class and model_kwargs
@@ -177,7 +184,8 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
                  use_adaptive_r=False,
                  r_ema_alpha=0.05,
                  r_min=100.0,
-                 r_max=10000.0):
+                 r_max=10000.0,
+                 use_mps=False):
 
         # Call parent class initialization (model loading)
         super().__init__(
@@ -185,7 +193,8 @@ class UAVNavigation(PHR_MODEL_LOADING_BASE):
             posreg_model_dir=posreg_model_dir,
             model_class=model_class,
             model_kwargs=model_kwargs,
-            dataset_kwargs=dataset_kwargs
+            dataset_kwargs=dataset_kwargs,
+            use_mps=use_mps,
         )
         
         # UAVNavigation specific initialization
@@ -1128,7 +1137,8 @@ def main_nav_test(
     use_adaptive_r=False,
     r_ema_alpha=0.05,
     r_min=100.0,
-    r_max=10000.0):
+    r_max=10000.0,
+    use_mps=False):
     """
     flag_suppl: Whether to use supplementary waypoints to test model performance on supplementary waypoints
     User needs to specify:
@@ -1300,6 +1310,7 @@ def main_nav_test(
             r_ema_alpha=r_ema_alpha,
             r_min=r_min,
             r_max=r_max,
+            use_mps=use_mps,
         )
         print("✓ UAVNavigation instance created successfully")
         print(f"  Device: {nav.device}")
@@ -1489,6 +1500,10 @@ def parse_args():
     parser.add_argument("--max_heading_rate", type=float, default=30.0,
                         help="Max heading change per step in degrees (default 30)")
 
+    # Device
+    parser.add_argument("--use_mps", action="store_true", default=False,
+                        help="Use Apple MPS backend on M1/M2 (default: CPU)")
+
     # Adaptive R
     parser.add_argument("--use_adaptive_r", action="store_true", default=False,
                         help="Enable EMA-based online estimation of model measurement noise R")
@@ -1583,6 +1598,7 @@ def main():
                         r_ema_alpha=args.r_ema_alpha,
                         r_min=args.r_min,
                         r_max=args.r_max,
+                        use_mps=args.use_mps,
                     )
 
 
